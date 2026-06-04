@@ -6,6 +6,6 @@ Place `appl/cmd/*.b`, `appl/lib/*.b` and `man/1/bzip2` in system, modify `appl/c
 
 Rebuild:
 ```bash
-cd appl/cmd
+cd appl
 mk install
 ```
