@@ -1,19 +1,24 @@
 # Compressor for the GNU bzip2 file format.
 #
-# Implements the Filter module interface (module/filter.m) as a
-# counterpart to appl/lib/bwtinflate.b. Produces output that
-# unpacks correctly with both our own bunzip2 and the standard
-# GNU bunzip2(1).
+# Implements the Filter module interface (module/filter.m) as the
+# counterpart to appl/lib/bwtinflate.b. Produces output that decodes
+# correctly with both our own bunzip2 and the standard GNU bunzip2(1).
 #
 # Pipeline:
 #
 #   raw --RLE-1--> BWT --MTF + RLE-2--> Huffman --bitstream
 #
-# This compressor uses two identical Huffman tables (the minimum
-# allowed by the spec, nGroups==2) with a single all-zero selector
-# list. That gives correct, well-formed output and good ratios for
-# typical inputs; a multi-table compressor would compress better on
-# heterogeneous data but is substantially more complex.
+# Uses two identical Huffman tables (the minimum allowed by the spec,
+# nGroups==2) with an all-zero selector list. That gives correct,
+# well-formed output and good ratios for typical inputs; a multi-table
+# compressor would compress better on heterogeneous data but is
+# substantially more complex.
+#
+# Memory note: on 64-bit Inferno `array of int` costs 8 bytes per
+# element, so a 900K-element int array is 7.2 MB. The hot paths
+# below avoid that by keeping per-symbol data in `array of byte`
+# where possible (MTF indices fit in 0..255) and by reusing buffers
+# across blocks rather than reallocating.
 
 implement Filter;
 
@@ -22,22 +27,12 @@ include "sys.m";
 
 include "filter.m";
 
-# RLE-1 threshold: GNU bzip2 collapses any run of 4 or more identical
-# bytes into "b b b b N" where N (0..251) is the extra count.
 RLE1_THRESHOLD:	con 4;
 
-# Symbol IDs in the inner alphabet after MTF + RLE-2:
-#   0 = RUNA      (zero-run base-2 digit 1)
-#   1 = RUNB      (zero-run base-2 digit 2)
-#   2..nSyms-2 = shifted MTF index (originals 1..alphaSize-1)
-#   nSyms-1 = EOB (end of block)
 RUNA:	con 0;
 RUNB:	con 1;
 
-# Group size: switch Huffman table every 50 symbols.
 GROUP_SIZE:	con 50;
-
-# Block size cap. 100000 * level bytes (matching bzip2 -1..-9 levels).
 BLOCKMULT:	con 100000;
 
 # ---------------- Module entry ----------------
@@ -67,14 +62,12 @@ compressor(level: int, rq: chan of ref Rq)
 {
 	bw := bw_new(rq);
 
-	# Stream header: "BZh" + digit.
 	bw_byte(bw, byte 'B');
 	bw_byte(bw, byte 'Z');
 	bw_byte(bw, byte 'h');
 	bw_byte(bw, byte ('0' + level));
 
 	# Stream-level CRC: running combiner of per-block CRCs.
-	# (s << 1) | ((s >> 31) & 1), then XOR block CRC. Held as 32-bit int.
 	streamCrc := 0;
 
 	blockMax := level * BLOCKMULT;
@@ -102,6 +95,7 @@ compressor(level: int, rq: chan of ref Rq)
 			srcLen += n;
 			continue;
 		}
+		# Full block ready.
 		crc := compress_block(bw, src[0:srcLen]);
 		streamCrc = (streamCrc << 1) | ((streamCrc >> 31) & 1);
 		streamCrc ^= crc;
@@ -109,8 +103,6 @@ compressor(level: int, rq: chan of ref Rq)
 	}
 }
 
-# Emit the 48-bit end-of-stream marker, the 32-bit stream CRC, and pad
-# to the next byte boundary.
 emit_eos(bw: ref Bitwriter, streamCrc: int)
 {
 	bw_bits(bw, 16r177245, 24);
@@ -129,7 +121,9 @@ compress_block(bw: ref Bitwriter, src: array of byte): int
 
 	rle := rle1_encode(src);
 	(L, origPtr) := bwt_encode(rle);
+	rle = nil;	# free RLE-1 buffer before MTF allocates
 	(syms, alphaBitmap, alphaCount) := mtf_rle2(L);
+	L = nil;	# L is no longer needed
 	nSyms := alphaCount + 2;
 
 	# Build a Huffman table over the inner alphabet.
@@ -143,30 +137,28 @@ compress_block(bw: ref Bitwriter, src: array of byte): int
 	bw_bit(bw, 0);
 	bw_bits(bw, origPtr, 24);
 
-	# Alphabet bitmap: 16 group bits, then 16 bits per used group.
 	bw_bits(bw, alphaBitmap.groupMask, 16);
 	for(g := 0; g < 16; g++){
 		if((alphaBitmap.groupMask >> (15 - g)) & 1)
 			bw_bits(bw, alphaBitmap.groupBits[g], 16);
 	}
 
-	# nGroups = 2 (minimum), nSelectors covers `len syms` rounded up.
 	nGroups := 2;
 	nSelectors := (len syms + GROUP_SIZE - 1) / GROUP_SIZE;
 	if(nSelectors < 1) nSelectors = 1;
 	bw_bits(bw, nGroups, 3);
 	bw_bits(bw, nSelectors, 15);
 
-	# Selectors: all zero in MTF-encoded representation -> always group 0
-	# at the front. The unary code for 0 is a single '0' bit.
+	# All selectors zero. Group 0 is at front of the MTF list, so it
+	# encodes as a single '0' bit.
 	for(i := 0; i < nSelectors; i++)
 		bw_bit(bw, 0);
 
-	# Emit nGroups code-length tables. Both identical.
+	# nGroups identical code-length tables.
 	for(g = 0; g < nGroups; g++)
 		emit_code_table(bw, lens, nSyms);
 
-	# Emit symbol stream.
+	# Symbol stream.
 	for(i = 0; i < len syms; i++){
 		s := syms[i];
 		bw_bits(bw, codes[s], lens[s]);
@@ -174,8 +166,6 @@ compress_block(bw: ref Bitwriter, src: array of byte): int
 
 	return crc;
 }
-
-# ---------------- Alphabet bitmap ----------------
 
 AlphaBitmap: adt {
 	groupMask:	int;
@@ -192,10 +182,8 @@ bzcrc_init()
 {
 	if(bzcrcTab != nil) return;
 	bzcrcTab = array[256] of int;
-	# 0x04C11DB7 = 80378711, 0x80000000 as int is the sign bit (negative).
-	# Limbo's `int` is 32-bit signed; both literals fit when written in decimal.
 	poly := 16r04C11DB7;
-	highBit := 1 << 31;	# this is the sign bit in 32-bit int
+	highBit := 1 << 31;
 	for(i := 0; i < 256; i++){
 		c := i << 24;
 		for(j := 0; j < 8; j++){
@@ -211,13 +199,11 @@ bzcrc_init()
 bzip2_crc(buf: array of byte): int
 {
 	bzcrc_init();
-	# Initial value 0xFFFFFFFF = -1 in 32-bit two's complement.
 	crc := ~0;
 	for(i := 0; i < len buf; i++){
 		b := int buf[i];
 		crc = (crc << 8) ^ bzcrcTab[((crc >> 24) ^ b) & 16rFF];
 	}
-	# Final XOR with 0xFFFFFFFF = ~0.
 	return crc ^ ~0;
 }
 
@@ -225,7 +211,10 @@ bzip2_crc(buf: array of byte): int
 rle1_encode(src: array of byte): array of byte
 {
 	if(len src == 0) return array[0] of byte;
-	out := array[len src * 5 / 4 + 16] of byte;
+	# Upper bound: worst case is a +25% expansion (5 bytes for 4 runs).
+	# Pre-size to len src + a small margin and let growbytes handle the
+	# rare overflow.
+	out := array[len src + (len src >> 2) + 16] of byte;
 	op := 0;
 	i := 0;
 	while(i < len src){
@@ -248,7 +237,10 @@ rle1_encode(src: array of byte): array of byte
 		}
 		i += run;
 	}
-	return out[0:op];
+	if(op == len out) return out;
+	trimmed := array[op] of byte;
+	trimmed[0:] = out[0:op];
+	return trimmed;
 }
 
 # ---------------- Burrows-Wheeler transform ----------------
@@ -304,6 +296,9 @@ bwt_sort(sa: array of int, src2: array of byte, n: int)
 		tmp[pos[k]++] = sa[i];
 	}
 	for(i = 0; i < n; i++) sa[i] = tmp[i];
+	tmp = nil;
+	pos = nil;
+	bcount = nil;
 	for(i = 0; i < BUCKETS; i++){
 		lo := off[i];
 		hi := off[i+1] - 1;
@@ -360,6 +355,22 @@ cmp_rot_from(a, b, from: int, src2: array of byte, n: int): int
 }
 
 # ---------------- MTF + RLE-2 combined pass ----------------
+# Returns the inner symbol stream (RUNA, RUNB, shifted MTF indices,
+# trailing EOB), the alphabet bitmap, and the alphabet size.
+#
+# Symbol encoding (per bzip2 spec):
+#   0           = RUNA
+#   1           = RUNB
+#   2..alphaCount = shifted MTF index (originals 1..alphaCount-1)
+#   alphaCount+1 = EOB
+#
+# Max value = alphaCount + 1, up to 257 when alphabet is full. We
+# therefore store symbols as `array of int`. On 64-bit Inferno that
+# costs 8 bytes per element, but the buffer is bounded by len L
+# (block size, <= 900 KB), so peak ~7.2 MB matches the analogous
+# `next[]` array in the inverse BWT in the decoder; both stay within
+# the 32 MB heap.
+
 mtf_rle2(L: array of byte): (array of int, ref AlphaBitmap, int)
 {
 	used := array[256] of int;
@@ -367,6 +378,7 @@ mtf_rle2(L: array of byte): (array of int, ref AlphaBitmap, int)
 	for(i = 0; i < len L; i++) used[int L[i]] = 1;
 	alphaCount := 0;
 	for(i = 0; i < 256; i++) if(used[i]) alphaCount++;
+
 	alpha := array[alphaCount] of byte;
 	mtfPos := array[256] of int;
 	for(i = 0; i < 256; i++) mtfPos[i] = -1;
@@ -396,9 +408,10 @@ mtf_rle2(L: array of byte): (array of int, ref AlphaBitmap, int)
 			bm.groupMask |= 1 << (15 - g);
 	}
 
-	nSyms := alphaCount + 2;
-	EOB := nSyms - 1;
-	out := array[len L + 16] of int;
+	# Output buffer. Length is bounded by len L (MTF/RLE-2 never
+	# expands), so we pre-size and don't grow.
+	cap := len L + 16;
+	out := array[cap] of int;
 	op := 0;
 	zeros := 0;
 	for(i = 0; i < len L; i++){
@@ -423,9 +436,16 @@ mtf_rle2(L: array of byte): (array of int, ref AlphaBitmap, int)
 	}
 	if(zeros > 0)
 		op = emit_zerorun(out, op, zeros);
+
+	# Append EOB.
 	if(op >= len out) out = growints(out, op + 8);
-	out[op++] = EOB;
-	return (out[0:op], bm, alphaCount);
+	out[op++] = alphaCount + 1;
+
+	if(op == len out)
+		return (out, bm, alphaCount);
+	trimmed := array[op] of int;
+	trimmed[0:] = out[0:op];
+	return (trimmed, bm, alphaCount);
 }
 
 emit_zerorun(out: array of int, op: int, n: int): int
@@ -444,16 +464,12 @@ emit_zerorun(out: array of int, op: int, n: int): int
 	return op;
 }
 
-# ---------------- Huffman ----------------
-
 huff_lengths(syms: array of int, nSyms: int): array of int
 {
 	freq := array[nSyms] of int;
 	for(i := 0; i < nSyms; i++) freq[i] = 0;
 	for(i = 0; i < len syms; i++) freq[syms[i]]++;
 
-	# bzip2 requires every alphabet symbol to have length 1..20.
-	# Bias unused symbols up to weight 1 so they get a code.
 	wfreq := array[nSyms] of int;
 	for(i = 0; i < nSyms; i++)
 		if(freq[i] > 0) wfreq[i] = freq[i];
@@ -464,7 +480,6 @@ huff_lengths(syms: array of int, nSyms: int): array of int
 	maxd := 0;
 	for(i = 0; i < nSyms; i++) if(lens[i] > maxd) maxd = lens[i];
 	if(maxd > 20){
-		# Flat code over the alphabet; ceil(log2(nSyms)) capped to 20.
 		bits := 1;
 		while((1 << bits) < nSyms) bits++;
 		if(bits > 20) bits = 20;
@@ -568,10 +583,10 @@ emit_code_table(bw: ref Bitwriter, lens: array of int, nSyms: int)
 		while(cur != tgt){
 			bw_bit(bw, 1);
 			if(cur < tgt){
-				bw_bit(bw, 0);	# increment
+				bw_bit(bw, 0);
 				cur++;
 			} else {
-				bw_bit(bw, 1);	# decrement
+				bw_bit(bw, 1);
 				cur--;
 			}
 		}
@@ -665,8 +680,6 @@ finished(rq: chan of ref Rq)
 {
 	rq <-= ref Rq.Finished(nil);
 }
-
-# ---------------- Array growth helpers ----------------
 
 growbytes(a: array of byte, newlen: int): array of byte
 {

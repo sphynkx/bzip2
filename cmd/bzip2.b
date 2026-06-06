@@ -2,7 +2,7 @@ implement Bzip2;
 
 include "sys.m";
 	sys:	Sys;
-	print, fprint: import sys;
+	fprint: import sys;
 
 include "draw.m";
 
@@ -70,8 +70,6 @@ init(nil: ref Draw->Context, argv: list of string)
 		a := hd argv;
 		if(len a < 2 || a[0] != '-' || a == "--")
 			break;
-		# Single-letter flags may be combined: -ck, -kv, etc.
-		# Digit -1..-9 sets the compression level.
 		ok := 1;
 		for(i := 1; i < len a; i++){
 			c := a[i];
@@ -129,7 +127,6 @@ bzip2f(file: string): int
 		return 0;
 	}
 
-	# Keep directory prefix so `bzip2 /tmp/foo` writes /tmp/foo.bz2.
 	ofile := file + ".bz2";
 	bout := bufio->create(ofile, Bufio->OWRITE, 8r666);
 	if(bout == nil){
